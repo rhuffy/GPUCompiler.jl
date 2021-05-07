@@ -21,6 +21,7 @@ include("ptx.jl")
 include("spirv.jl")
 include("gcn.jl")
 include("bpf.jl")
+incluude("wasm.jl")
 
 include("examples.jl")
 

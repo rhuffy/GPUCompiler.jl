@@ -27,6 +27,7 @@ include("ptx.jl")
 include("gcn.jl")
 include("spirv.jl")
 include("bpf.jl")
+include("wasm.jl")
 
 include("runtime.jl")
 
