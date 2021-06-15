@@ -23,8 +23,7 @@ function llvm_machine(target::WASMCompilerTarget)
 end
 
 function process_entry!(job::CompilerJob{WASMCompilerTarget}, mod::LLVM.Module, entry::LLVM.Function)
-  print("process entry")
-  push!(function_attributes(entry), StringAttribute("wasm-export-name", LLVM.name(entry), context(mod)))
+  push!(function_attributes(entry), StringAttribute("wasm-export-name", String(chop(LLVM.name(entry), tail=4)), context(mod)))
   invoke(process_entry!, Tuple{CompilerJob, LLVM.Module, LLVM.Function}, job, mod, entry)
 end
 
