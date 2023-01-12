@@ -21,11 +21,11 @@ const wasmfunction_cache = Dict{UInt,Any}()
 function wasmfunction_compile(@nospecialize(job::WASMCompilerJob))
 
   # compile to WASM
-  method_instance, world = GPUCompiler.emit_julia(job)
-  ir, kernel = GPUCompiler.emit_llvm(job, method_instance, world; libraries=true)
+  mi, mi_meta = GPUCompiler.emit_julia(job)
+  ir, ir_meta = GPUCompiler.emit_llvm(job, mi; libraries=true, ctx=JuliaContext())
   print(ir)
-  code = GPUCompiler.emit_asm(job, ir, kernel; format=LLVM.API.LLVMObjectFile, validate=false)
-  return collect(codeunits(code))
+  asm, asm_meta = GPUCompiler.emit_asm(job, ir; format=LLVM.API.LLVMObjectFile, validate=false)
+  return collect(codeunits(asm))
 end
 wasmfunction_link(@nospecialize(job::WASMCompilerJob), exe) = exe
 
