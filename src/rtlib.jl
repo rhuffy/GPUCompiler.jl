@@ -39,7 +39,7 @@ function LLVM.call!(builder, rt::Runtime.RuntimeMethodInstance, args=LLVM.Value[
         f = functions(mod)[rt.llvm_name]
         ft = eltype(llvmtype(f))
     else
-        ft = convert(LLVM.FunctionType, rt, ctx)
+        ft = convert(LLVM.FunctionType, rt; ctx)
         f = LLVM.Function(mod, rt.llvm_name, ft)
     end
 
@@ -63,29 +63,23 @@ end
 
 ## functionality to build the runtime library
 
-function emit_function!(mod, @nospecialize(job::CompilerJob), f, method)
+function emit_function!(mod, @nospecialize(job::CompilerJob), f, method; ctx::JuliaContextType)
     tt = Base.to_tuple_type(method.types)
-    new_mod, entry = codegen(:llvm, similar(job, FunctionSpec(f, tt, #=kernel=# false));
-                             optimize=false, libraries=false)
-    ft = eltype(llvmtype(entry))
-    expected_ft = convert(LLVM.FunctionType, method, context(new_mod))
-    if return_type(ft) != return_type(expected_ft)
-        error("Invalid return type for runtime function '$(method.name)': expected $(return_type(expected_ft)), got $(return_type(ft))")
+    new_mod, meta = codegen(:llvm, similar(job, FunctionSpec(f, tt, #=kernel=# false));
+                            optimize=false, libraries=false, ctx)
+    ft = eltype(llvmtype(meta.entry))
+    expected_ft = convert(LLVM.FunctionType, method; ctx=context(new_mod))
+    if LLVM.return_type(ft) != LLVM.return_type(expected_ft)
+        error("Invalid return type for runtime function '$(method.name)': expected $(LLVM.return_type(expected_ft)), got $(LLVM.return_type(ft))")
     end
 
     # recent Julia versions include prototypes for all runtime functions, even if unused
-    pm = ModulePassManager()
-    strip_dead_prototypes!(pm)
-    run!(pm, new_mod)
-    dispose(pm)
+    @dispose pm=ModulePassManager() begin
+        strip_dead_prototypes!(pm)
+        run!(pm, new_mod)
+    end
 
-    temp_name = LLVM.name(entry)
-    # FIXME: on 1.6, there's no single global LLVM context anymore,
-    #        but there's no API yet to pass a context to codegen.
-    # round-trip the module through serialization to get it in the proper context.
-    buf = convert(MemoryBuffer, new_mod)
-    new_mod = parse(LLVM.Module, buf, context(mod))
-    @assert context(mod) == context(new_mod)
+    temp_name = LLVM.name(meta.entry)
     link!(mod, new_mod)
     entry = functions(mod)[temp_name]
 
@@ -101,8 +95,13 @@ function emit_function!(mod, @nospecialize(job::CompilerJob), f, method)
     LLVM.name!(entry, name)
 end
 
-function build_runtime(@nospecialize(job::CompilerJob), ctx)
-    mod = LLVM.Module("GPUCompiler run-time library", ctx)
+function build_runtime(@nospecialize(job::CompilerJob); ctx)
+    mod = LLVM.Module("GPUCompiler run-time library"; ctx=unwrap_context(ctx))
+
+    # the compiler job passed into here is identifies the job that requires the runtime.
+    # derive a job that represents the runtime itself (notably with kernel=false).
+    source = FunctionSpec(typeof(identity), Tuple{Nothing}, false, nothing, job.source.world_age)
+    job = CompilerJob(job.target, source, job.params)
 
     for method in values(Runtime.methods)
         def = if isa(method.def, Symbol)
@@ -111,17 +110,20 @@ function build_runtime(@nospecialize(job::CompilerJob), ctx)
         else
             method.def
         end
-        emit_function!(mod, job, def, method)
+        emit_function!(mod, job, typeof(def), method; ctx)
     end
 
-    optimize!(job, mod)
+    # we cannot optimize the runtime library, because the code would then be optimized again
+    # during main compilation (and optimizing twice isn't safe). for example, optimization
+    # removes Julia address spaces, which would then lead to type mismatches when using
+    # functions from the runtime library from IR that has not been stripped of AS info.
 
     mod
 end
 
 const runtime_lock = ReentrantLock()
 
-@locked function load_runtime(@nospecialize(job::CompilerJob), ctx)
+@locked function load_runtime(@nospecialize(job::CompilerJob); ctx)
     lock(runtime_lock) do
         # find the first existing cache directory (for when dealing with layered depots)
         cachedirs = [cachedir(depot) for depot in DEPOT_PATH]
@@ -151,7 +153,7 @@ const runtime_lock = ReentrantLock()
         lib = try
             if ispath(path)
                 open(path) do io
-                    parse(LLVM.Module, read(io), ctx)
+                    parse(LLVM.Module, read(io); ctx=unwrap_context(ctx))
                 end
             end
         catch ex
@@ -162,7 +164,7 @@ const runtime_lock = ReentrantLock()
         if lib === nothing
             @debug "Building the GPU runtime library at $path"
             mkpath(output_dir)
-            lib = build_runtime(job, ctx)
+            lib = build_runtime(job; ctx)
 
             # atomic write to disk
             temp_path, io = mktemp(dirname(path); cleanup=false)

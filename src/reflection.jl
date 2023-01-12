@@ -16,13 +16,14 @@ function pygmentize()
     return _pygmentize[]
 end
 
-function highlight(io::Base.TTY, code, lexer)
+function highlight(io::IO, code, lexer)
     highlighter = pygmentize()
     have_color = get(io, :color, false)
-    if highlighter === nothing || !have_color
+    if !have_color
         print(io, code)
-        return code
-    else
+    elseif lexer == "llvm"
+        InteractiveUtils.print_llvm(io, code)
+    elseif highlighter !== nothing
         custom_lexer = joinpath(dirname(@__DIR__), "res", "pygments", "$lexer.py")
         if isfile(custom_lexer)
             lexer = `$custom_lexer -x`
@@ -32,46 +33,77 @@ function highlight(io::Base.TTY, code, lexer)
         print(pipe, code)
         close(pipe.in)
         print(io, read(pipe, String))
+    else
+        print(io, code)
     end
+    return
 end
 
-highlight(io, code, lexer) = print(io, code)
+#
+# Compat shims
+#
 
+include("reflection_compat.jl")
 
 #
 # code_* replacements
 #
 
+@inline function typed_signature(@nospecialize(job::CompilerJob))
+    u = Base.unwrap_unionall(job.source.tt)
+    return Base.rewrap_unionall(Tuple{job.source.f, u.parameters...}, job.source.tt)
+end
+
 code_lowered(@nospecialize(job::CompilerJob); kwargs...) =
-    InteractiveUtils.code_lowered(job.source.f, job.source.tt; kwargs...)
+    code_lowered_by_type(typed_signature(job); kwargs...)
 
 function code_typed(@nospecialize(job::CompilerJob); interactive::Bool=false, kwargs...)
     # TODO: use the compiler driver to get the Julia method instance (we might rewrite it)
+    tt = typed_signature(job)
     if interactive
         # call Cthulhu without introducing a dependency on Cthulhu
         mod = get(Base.loaded_modules, Cthulhu, nothing)
         mod===nothing && error("Interactive code reflection requires Cthulhu; please install and load this package first.")
+        interp = get_interpreter(job)
         descend_code_typed = getfield(mod, :descend_code_typed)
-        descend_code_typed(job.source.f, job.source.tt; kwargs...)
+        descend_code_typed(tt; interp, kwargs...)
+    elseif VERSION >= v"1.7-"
+        interp = get_interpreter(job)
+        Base.code_typed_by_type(tt; interp, kwargs...)
     else
-        InteractiveUtils.code_typed(job.source.f, job.source.tt; kwargs...)
+        Base.code_typed_by_type(tt; kwargs...)
     end
 end
 
 function code_warntype(io::IO, @nospecialize(job::CompilerJob); interactive::Bool=false, kwargs...)
     # TODO: use the compiler driver to get the Julia method instance (we might rewrite it)
+    tt = typed_signature(job)
     if interactive
         @assert io == stdout
         # call Cthulhu without introducing a dependency on Cthulhu
         mod = get(Base.loaded_modules, Cthulhu, nothing)
         mod===nothing && error("Interactive code reflection requires Cthulhu; please install and load this package first.")
+        interp = get_interpreter(job)
         descend_code_warntype = getfield(mod, :descend_code_warntype)
-        descend_code_warntype(job.source.f, job.source.tt; kwargs...)
+        descend_code_warntype(tt; interp, kwargs...)
+    elseif VERSION >= v"1.7-"
+        interp = get_interpreter(job)
+        code_warntype_by_type(io, tt; interp, kwargs...)
     else
-        InteractiveUtils.code_warntype(io, job.source.f, job.source.tt; kwargs...)
+        code_warntype_by_type(io, tt; kwargs...)
     end
 end
 code_warntype(@nospecialize(job::CompilerJob); kwargs...) = code_warntype(stdout, job; kwargs...)
+
+InteractiveUtils.code_lowered(err::InvalidIRError; kwargs...) = code_lowered(err.job; kwargs...)
+InteractiveUtils.code_typed(err::InvalidIRError; kwargs...) = code_typed(err.job; kwargs...)
+InteractiveUtils.code_warntype(err::InvalidIRError; kwargs...) = code_warntype(err.job; kwargs...)
+
+# For VERSION >= v"1.9.0-DEV.516"
+struct jl_llvmf_dump
+    TSM::LLVM.API.LLVMOrcThreadSafeModuleRef
+    F::LLVM.API.LLVMValueRef
+end
 
 """
     code_llvm([io], job; optimize=true, raw=false, dump_module=false)
@@ -88,12 +120,38 @@ The following keyword arguments are supported:
 See also: [`@device_code_llvm`](@ref), `InteractiveUtils.code_llvm`
 """
 function code_llvm(io::IO, @nospecialize(job::CompilerJob); optimize::Bool=true, raw::Bool=false,
-                   debuginfo::Symbol=:default, dump_module::Bool=false)
+                   debuginfo::Symbol=:default, dump_module::Bool=false, kwargs...)
     # NOTE: jl_dump_function_ir supports stripping metadata, so don't do it in the driver
-    ir, entry = codegen(:llvm, job; optimize=optimize, strip=false, validate=false)
-    str = ccall(:jl_dump_function_ir, Ref{String},
-                (LLVM.API.LLVMValueRef, Bool, Bool, Ptr{UInt8}),
-                entry, !raw, dump_module, debuginfo)
+    str = JuliaContext() do ctx
+        ir, meta = codegen(:llvm, job; optimize=optimize, strip=false, validate=false, ctx, kwargs...)
+        @static if VERSION >= v"1.9.0-DEV.516"
+            ts_mod = ThreadSafeModule(ir; ctx)
+            if VERSION >= v"1.9.0-DEV.672"
+                entry_fn = meta.entry
+                GC.@preserve ts_mod entry_fn begin
+                    value = Ref(jl_llvmf_dump(ts_mod.ref, entry_fn.ref))
+                    ccall(:jl_dump_function_ir, Ref{String},
+                          (Ptr{jl_llvmf_dump}, Bool, Bool, Ptr{UInt8}),
+                          value, !raw, dump_module, debuginfo)
+                end
+            else
+                entry_fn = meta.entry
+                GC.@preserve ts_mod entry_fn begin
+                    # N.B. jl_dump_function_ir will `Libc.free` the passed-in pointer
+                    value_ptr = reinterpret(Ptr{jl_llvmf_dump},
+                                            Libc.malloc(sizeof(jl_llvmf_dump)))
+                    unsafe_store!(value_ptr, jl_llvmf_dump(ts_mod.ref, entry_fn.ref))
+                    ccall(:jl_dump_function_ir, Ref{String},
+                          (Ptr{jl_llvmf_dump}, Bool, Bool, Ptr{UInt8}),
+                          value_ptr, !raw, dump_module, debuginfo)
+                end
+            end
+        else
+            ccall(:jl_dump_function_ir, Ref{String},
+                  (LLVM.API.LLVMValueRef, Bool, Bool, Ptr{UInt8}),
+                  meta.entry, !raw, dump_module, debuginfo)
+        end
+    end
     highlight(io, str, "llvm")
 end
 code_llvm(@nospecialize(job::CompilerJob); kwargs...) = code_llvm(stdout, job; kwargs...)
@@ -112,7 +170,7 @@ The following keyword arguments are supported:
 See also: [`@device_code_native`](@ref), `InteractiveUtils.code_llvm`
 """
 function code_native(io::IO, @nospecialize(job::CompilerJob); raw::Bool=false, dump_module::Bool=false)
-    asm, _ = codegen(:asm, job; strip=!raw, only_entry=!dump_module, validate=false)
+    asm, meta = codegen(:asm, job; strip=!raw, only_entry=!dump_module, validate=false)
     highlight(io, asm, source_code(job.target))
 end
 code_native(@nospecialize(job::CompilerJob); kwargs...) =
@@ -183,8 +241,8 @@ See also: `InteractiveUtils.@code_typed`
 macro device_code_typed(ex...)
     quote
         output = Dict{CompilerJob,Any}()
-        function hook(job::CompilerJob)
-            output[job] = code_typed(job)
+        function hook(job::CompilerJob; kwargs...)
+            output[job] = code_typed(job; kwargs...)
         end
         $(emit_hooked_compilation(:hook, ex...))
         output
@@ -248,7 +306,6 @@ Evaluates the expression `ex` and dumps all intermediate forms of code to the di
 `dir`.
 """
 macro device_code(ex...)
-    only(xs) = (@assert length(xs) == 1; first(xs))
     localUnique = 1
     function hook(job::CompilerJob; dir::AbstractString)
         name = something(job.source.name, nameof(job.source.f))
@@ -274,7 +331,7 @@ macro device_code(ex...)
         end
 
         open(joinpath(dir, "$fn.asm"), "w") do io
-            code_native(io, job; dump_module=true)
+            code_native(io, job; dump_module=true, raw=true)
         end
 
         localUnique += 1

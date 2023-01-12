@@ -2,21 +2,41 @@
 
 export InvalidIRError
 
+function method_matches(@nospecialize(tt::Type{<:Tuple}); world=Base.get_world_counter())
+    ms = Core.MethodMatch[]
+    for m in Base._methods_by_ftype(tt, -1, world)::Vector
+        m = m::Core.MethodMatch
+        push!(ms, m)
+    end
+
+    return ms
+end
+
+function return_type(m::Core.MethodMatch;
+                     interp = Core.Compiler.NativeInterpreter(world))
+    ty = Core.Compiler.typeinf_type(interp, m.method, m.spec_types, m.sparams)
+    return something(ty, Any)
+end
+
+
 function check_method(@nospecialize(job::CompilerJob))
     isa(job.source.f, Core.Builtin) && throw(KernelError(job, "function is not a generic function"))
 
     # get the method
-    ms = Base.methods(job.source.f, job.source.tt)
+    world = job.source.world
+    ms = method_matches(typed_signature(job); world)
     isempty(ms)   && throw(KernelError(job, "no method found"))
     length(ms)!=1 && throw(KernelError(job, "no unique matching method"))
-    m = first(ms)
 
     # kernels can't return values
     if job.source.kernel
         cache = ci_cache(job)
         mt = method_table(job)
-        interp = GPUInterpreter(cache, mt, job.source.world)
-        rt = Base.return_types(job.source.f, job.source.tt, interp)[1]
+        ip = inference_params(job)
+        op = optimization_params(job)
+        interp = GPUInterpreter(cache, mt, world, ip, op)
+        rt = return_type(only(ms); interp)
+
         if rt != Nothing
             throw(KernelError(job, "kernel returns a value of type `$rt`",
                 """Make sure your kernel function ends in `return`, `return nothing` or `nothing`.
@@ -53,10 +73,12 @@ function explain_nonisbits(@nospecialize(dt), depth=1; maxdepth=10)
     return msg
 end
 
-function check_invocation(@nospecialize(job::CompilerJob), entry::LLVM.Function)
+function check_invocation(@nospecialize(job::CompilerJob))
     # make sure any non-isbits arguments are unused
     real_arg_i = 0
-    sig = Base.signature_type(job.source.f, job.source.tt)::Type
+
+    sig = typed_signature(job)
+
     for (arg_i,dt) in enumerate(sig.parameters)
         isghosttype(dt) && continue
         Core.Compiler.isconstType(dt) && continue
@@ -91,16 +113,24 @@ const DYNAMIC_CALL     = "dynamic function invocation"
 function Base.showerror(io::IO, err::InvalidIRError)
     print(io, "InvalidIRError: compiling ", err.job.source, " resulted in invalid LLVM IR")
     for (kind, bt, meta) in err.errors
-        print(io, "\nReason: unsupported $kind")
+        printstyled(io, "\nReason: unsupported $kind"; color=:red)
         if meta !== nothing
             if kind == RUNTIME_FUNCTION || kind == UNKNOWN_FUNCTION || kind == POINTER_FUNCTION || kind == DYNAMIC_CALL
-                print(io, " (call to ", meta, ")")
+                printstyled(io, " (call to ", meta, ")"; color=:red)
             elseif kind == DELAYED_BINDING
-                print(io, " (use of '", meta, "')")
+                printstyled(io, " (use of '", meta, "')"; color=:red)
             end
         end
         Base.show_backtrace(io, bt)
     end
+    println(io)
+    printstyled(io, "Hint"; bold = true, color = :cyan)
+    printstyled(
+        io,
+        ": catch this exception as `err` and call `code_typed(err; interactive = true)` to",
+        " introspect the erronous code with Cthulhu.jl";
+        color = :cyan,
+    )
     return
 end
 
@@ -118,6 +148,9 @@ function check_ir!(job, errors::Vector{IRError}, mod::LLVM.Module)
     for f in functions(mod)
         check_ir!(job, errors, f)
     end
+
+    # custom validation
+    append!(errors, validate_module(job, mod))
 
     return errors
 end
@@ -141,9 +174,9 @@ function check_ir!(job, errors::Vector{IRError}, inst::LLVM.CallInst)
         fn = LLVM.name(dest)
 
         # some special handling for runtime functions that we don't implement
-        if fn == "jl_get_binding_or_error"
+        if fn == "jl_get_binding_or_error" || fn == "ijl_get_binding_or_error"
             try
-                m, sym, _ = operands(inst)
+                m, sym = arguments(inst)
                 sym = first(operands(sym::ConstantExpr))::ConstantInt
                 sym = convert(Int, sym)
                 sym = Ptr{Cvoid}(sym)
@@ -153,9 +186,9 @@ function check_ir!(job, errors::Vector{IRError}, inst::LLVM.CallInst)
                 @debug "Decoding arguments to jl_get_binding_or_error failed" inst bb=LLVM.parent(inst)
                 push!(errors, (DELAYED_BINDING, bt, nothing))
             end
-        elseif fn == "jl_invoke"
+        elseif fn == "jl_invoke" || fn == "ijl_invoke"
             try
-                f, args, nargs, meth = operands(inst)
+                f, args, nargs, meth = arguments(inst)
                 meth = first(operands(meth::ConstantExpr))::ConstantInt
                 meth = convert(Int, meth)
                 meth = Ptr{Cvoid}(meth)
@@ -165,9 +198,9 @@ function check_ir!(job, errors::Vector{IRError}, inst::LLVM.CallInst)
                 @debug "Decoding arguments to jl_invoke failed" inst bb=LLVM.parent(inst)
                 push!(errors, (DYNAMIC_CALL, bt, nothing))
             end
-        elseif fn == "jl_apply_generic"
+        elseif fn == "jl_apply_generic" || fn == "ijl_apply_generic"
             try
-                f, args, nargs, _ = operands(inst)
+                f, args, nargs = arguments(inst)
                 f = first(operands(f))::ConstantInt # get rid of inttoptr
                 f = convert(Int, f)
                 f = Ptr{Cvoid}(f)
@@ -201,7 +234,7 @@ function check_ir!(job, errors::Vector{IRError}, inst::LLVM.CallInst)
 
     elseif isa(dest, ConstantExpr)
         # detect calls to literal pointers
-        if occursin("inttoptr", string(dest))
+        if opcode(dest) == LLVM.API.LLVMIntToPtr
             # extract the literal pointer
             ptr_arg = first(operands(dest))
             @compiler_assert isa(ptr_arg, ConstantInt) job
@@ -211,8 +244,8 @@ function check_ir!(job, errors::Vector{IRError}, inst::LLVM.CallInst)
             if !valid_function_pointer(job, ptr)
                 # look it up in the Julia JIT cache
                 frames = ccall(:jl_lookup_code_address, Any, (Ptr{Cvoid}, Cint,), ptr, 0)
-                if length(frames) >= 1
-                    @compiler_assert length(frames) == 1 job frames=frames
+                # XXX: what if multiple frames are returned? rare, but happens
+                if length(frames) == 1
                     fn, file, line, linfo, fromC, inlined = last(frames)
                     push!(errors, (POINTER_FUNCTION, bt, fn))
                 else

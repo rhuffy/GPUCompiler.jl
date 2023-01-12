@@ -7,11 +7,26 @@ end
 
 # create a native test compiler, and generate reflection methods for it
 
-function native_job(@nospecialize(func), @nospecialize(types); kernel::Bool=false, kwargs...)
-    source = FunctionSpec(func, Base.to_tuple_type(types), kernel)
-    target = NativeCompilerTarget(always_inline=true)
-    params = TestCompilerParams()
-    CompilerJob(target, source, params), kwargs
+NativeCompilerJob = CompilerJob{NativeCompilerTarget,TestCompilerParams}
+
+# local method table for device functions
+@static if isdefined(Base.Experimental, Symbol("@overlay"))
+Base.Experimental.@MethodTable(method_table)
+else
+const method_table = nothing
+end
+
+GPUCompiler.method_table(@nospecialize(job::NativeCompilerJob)) = method_table
+GPUCompiler.can_safepoint(@nospecialize(job::NativeCompilerJob)) = job.params.entry_safepoint
+
+function native_job(@nospecialize(f_type), @nospecialize(types);
+                    kernel::Bool=false, entry_abi=:specfunc, entry_safepoint::Bool=false,
+                    always_inline=false, llvm_always_inline=true, jlruntime::Bool=false,
+                    kwargs...)
+    source = FunctionSpec(f_type, Base.to_tuple_type(types), kernel)
+    target = NativeCompilerTarget(; llvm_always_inline, jlruntime)
+    params = TestCompilerParams(entry_safepoint)
+    CompilerJob(target, source, params, entry_abi, always_inline), kwargs
 end
 
 function native_code_typed(@nospecialize(func), @nospecialize(types); kwargs...)
@@ -51,86 +66,199 @@ end
 
 module LazyCodegen
     using LLVM
+    using LLVM.Interop
     using GPUCompiler
 
     import ..native_job
 
-    # We have one global JIT and TM
-    const jit = Ref{LLVM.OrcJIT}()
-    const tm  = Ref{LLVM.TargetMachine}()
+    @static if Base.libllvm_version < v"12"
+        # We have one global JIT and TM
+        const jit = Ref{LLVM.OrcJIT}()
+        const tm  = Ref{LLVM.TargetMachine}()
 
-    function __init__()
-        optlevel = LLVM.API.LLVMCodeGenLevelDefault
+        function __init__()
+            optlevel = LLVM.API.LLVMCodeGenLevelDefault
 
-        tm[] = GPUCompiler.JITTargetMachine(optlevel=optlevel)
-        LLVM.asm_verbosity!(tm[], true)
+            tm[] = GPUCompiler.JITTargetMachine(optlevel=optlevel)
+            LLVM.asm_verbosity!(tm[], true)
 
-        jit[] = LLVM.OrcJIT(tm[]) # takes ownership of tm
-        atexit() do
-            dispose(jit[])
+            jit[] = LLVM.OrcJIT(tm[]) # takes ownership of tm
+            atexit() do
+                dispose(jit[])
+            end
+        end
+
+        import GPUCompiler: deferred_codegen_jobs, CompilerJob
+        mutable struct CallbackContext
+            job::CompilerJob
+            stub::String
+            compiled::Bool
+        end
+
+        const outstanding = IdDict{CallbackContext, Nothing}()
+
+        # Setup the lazy callback for creating a module
+        function callback(orc_ref::LLVM.API.LLVMOrcJITStackRef, callback_ctx::Ptr{Cvoid})
+            orc = LLVM.OrcJIT(orc_ref)
+            cc = Base.unsafe_pointer_to_objref(callback_ctx)::CallbackContext
+
+            @assert !cc.compiled
+            job = cc.job
+
+            entry_name, jitted_mod = JuliaContext() do ctx
+                ir, meta = GPUCompiler.codegen(:llvm, job; validate=false, ctx)
+                name(meta.entry), compile!(orc, ir)
+            end
+
+            addr = addressin(orc, jitted_mod, entry_name)
+            ptr  = pointer(addr)
+
+            cc.compiled = true
+            delete!(outstanding, cc)
+
+            # 4. Update the stub pointer to point to the recently compiled module
+            set_stub!(orc, cc.stub, ptr)
+
+            # 5. Return the address of the implementation, since we are going to call it now
+            return UInt64(reinterpret(UInt, ptr))
+        end
+
+        function get_trampoline(job)
+            cc = CallbackContext(job, String(gensym(:trampoline)), false)
+            outstanding[cc] = nothing
+
+            c_callback = @cfunction(callback, UInt64, (LLVM.API.LLVMOrcJITStackRef, Ptr{Cvoid}))
+
+            orc = jit[]
+            initial_addr = callback!(orc, c_callback, pointer_from_objref(cc))
+            create_stub!(orc, cc.stub, initial_addr)
+            return address(orc, cc.stub)
+        end
+    else # LLVM >=12
+
+        function absolute_symbol_materialization(name, ptr)
+            address = LLVM.API.LLVMOrcJITTargetAddress(reinterpret(UInt, ptr))
+            flags = LLVM.API.LLVMJITSymbolFlags(LLVM.API.LLVMJITSymbolGenericFlagsExported, 0)
+            symbol = LLVM.API.LLVMJITEvaluatedSymbol(address, flags)
+            gv = LLVM.API.LLVMJITCSymbolMapPair(name, symbol)
+
+            return LLVM.absolute_symbols(Ref(gv))
+        end
+
+        function define_absolute_symbol(jd, name)
+            ptr = LLVM.find_symbol(name)
+            if ptr !== C_NULL
+                LLVM.define(jd, absolute_symbol_materialization(name, ptr))
+                return true
+            end
+            return false
+        end
+
+        struct CompilerInstance
+            jit::LLVM.LLJIT
+            lctm::LLVM.LazyCallThroughManager
+            ism::LLVM.IndirectStubsManager
+        end
+        const jit = Ref{CompilerInstance}()
+
+        function __init__()
+            optlevel = LLVM.API.LLVMCodeGenLevelDefault
+            tm = GPUCompiler.JITTargetMachine(optlevel=optlevel)
+            LLVM.asm_verbosity!(tm, true)
+
+            lljit = LLJIT(;tm)
+
+            jd_main = JITDylib(lljit)
+
+            prefix = LLVM.get_prefix(lljit)
+            dg = LLVM.CreateDynamicLibrarySearchGeneratorForProcess(prefix)
+            add!(jd_main, dg)
+            if Sys.iswindows() && Int === Int64
+                # TODO can we check isGNU?
+                define_absolute_symbol(jd_main, mangle(lljit, "___chkstk_ms"))
+            end
+
+            es = ExecutionSession(lljit)
+
+            lctm = LLVM.LocalLazyCallThroughManager(triple(lljit), es)
+            ism = LLVM.LocalIndirectStubsManager(triple(lljit))
+
+            jit[] = CompilerInstance(lljit, lctm, ism)
+            atexit() do
+                ci = jit[]
+                dispose(ci.ism)
+                dispose(ci.lctm)
+                dispose(ci.jit)
+            end
+        end
+
+        function get_trampoline(job)
+            compiler = jit[]
+            lljit = compiler.jit
+            lctm  = compiler.lctm
+            ism   = compiler.ism
+
+            # We could also use one dylib per job
+            jd = JITDylib(lljit)
+
+            entry_sym = String(gensym(:entry))
+            target_sym = String(gensym(:target))
+            flags = LLVM.API.LLVMJITSymbolFlags(
+                LLVM.API.LLVMJITSymbolGenericFlagsCallable |
+                LLVM.API.LLVMJITSymbolGenericFlagsExported, 0)
+            entry = LLVM.API.LLVMOrcCSymbolAliasMapPair(
+                mangle(lljit, entry_sym),
+                LLVM.API.LLVMOrcCSymbolAliasMapEntry(
+                    mangle(lljit, target_sym), flags))
+
+            mu = LLVM.reexports(lctm, ism, jd, Ref(entry))
+            LLVM.define(jd, mu)
+
+            # 2. Lookup address of entry symbol
+            addr = lookup(lljit, entry_sym)
+
+            # 3. add MU that will call back into the compiler
+            sym = LLVM.API.LLVMOrcCSymbolFlagsMapPair(mangle(lljit, target_sym), flags)
+
+            function materialize(mr)
+                JuliaContext() do ctx
+                    ir, meta = GPUCompiler.codegen(:llvm, job; validate=false, ctx)
+
+                    # Rename entry to match target_sym
+                    LLVM.name!(meta.entry, target_sym)
+
+                    # So 1. serialize the module
+                    buf = convert(MemoryBuffer, ir)
+
+                    # 2. deserialize and wrap by a ThreadSafeModule
+                    ThreadSafeContext() do ctx
+                        mod = parse(LLVM.Module, buf; ctx=context(ctx))
+                        tsm = ThreadSafeModule(mod; ctx)
+
+                        il = LLVM.IRTransformLayer(lljit)
+                        LLVM.emit(il, mr, tsm)
+                    end
+                end
+
+                return nothing
+            end
+
+            function discard(jd, sym)
+            end
+
+            mu = LLVM.CustomMaterializationUnit(entry_sym, Ref(sym), materialize, discard)
+            LLVM.define(jd, mu)
+            return addr
         end
     end
 
-    import GPUCompiler: deferred_codegen_jobs, CompilerJob
-    mutable struct CallbackContext
-        job::CompilerJob
-        stub::String
-        compiled::Bool
-    end
+    import GPUCompiler: deferred_codegen_jobs
+    @generated function deferred_codegen(f::F, ::Val{tt}) where {F,tt}
+        # XXX: do we actually require the Julia runtime?
+        #      with jlruntime=false, we reach an unreachable.
+        job, _ = native_job(F, tt; jlruntime=true)
 
-    const outstanding = IdDict{CallbackContext, Nothing}()
-
-    # Setup the lazy callback for creating a module
-    function callback(orc_ref::LLVM.API.LLVMOrcJITStackRef, callback_ctx::Ptr{Cvoid})
-        orc = LLVM.OrcJIT(orc_ref)
-        cc = Base.unsafe_pointer_to_objref(callback_ctx)::CallbackContext
-
-        @assert !cc.compiled
-        job = cc.job
-
-        ir, entry = GPUCompiler.codegen(:llvm, job; validate=false)
-        entry_name = name(entry)
-
-        jitted_mod = compile!(orc, ir)
-
-        addr = addressin(orc, jitted_mod, entry_name)
-        ptr  = pointer(addr)
-
-        cc.compiled = true
-        delete!(outstanding, cc)
-
-        # 4. Update the stub pointer to point to the recently compiled module
-        set_stub!(orc, cc.stub, ptr)
-
-        # 5. Return the address of the implementation, since we are going to call it now
-        return UInt64(reinterpret(UInt, ptr))
-    end
-
-    @inline assume(cond::Bool) = Base.llvmcall(("""
-    declare void @llvm.assume(i1)
-
-    define void @entry(i8) #0 {
-        %cond = icmp eq i8 %0, 1
-        call void @llvm.assume(i1 %cond)
-        ret void
-    }
-
-    attributes #0 = { alwaysinline }""", "entry"),
-    Nothing, Tuple{Bool}, cond)
-
-
-    @generated function deferred_codegen(::Val{f}, ::Val{tt}) where {f,tt}
-        job, _ = native_job(f, tt)
-
-        cc = CallbackContext(job, String(gensym(:trampoline)), false)
-        outstanding[cc] = nothing
-
-        c_callback = @cfunction(callback, UInt64, (LLVM.API.LLVMOrcJITStackRef, Ptr{Cvoid}))
-
-        orc = jit[]
-        initial_addr = callback!(orc, c_callback, pointer_from_objref(cc))
-        create_stub!(orc, cc.stub, initial_addr)
-        addr = address(orc, cc.stub)
+        addr = get_trampoline(job)
         trampoline = pointer(addr)
         id = Base.reinterpret(Int, trampoline)
 
@@ -143,7 +271,7 @@ module LazyCodegen
         end
     end
 
-    @generated function abi_call(f::Ptr{Cvoid}, rt::Type{RT}, tt::Type{T}, args::Vararg{Any, N}) where {T, RT, N}
+    @generated function abi_call(f::Ptr{Cvoid}, rt::Type{RT}, tt::Type{T}, func::F, args::Vararg{Any, N}) where {T, RT, F, N}
         argtt    = tt.parameters[1]
         rettype  = rt.parameters[1]
         argtypes = DataType[argtt.parameters...]
@@ -154,9 +282,28 @@ module LazyCodegen
         before = :()
         after = :(ret)
 
+
         # Note this follows: emit_call_specfun_other
-        LLVM.Interop.JuliaContext() do ctx
-            T_jlvalue = LLVM.StructType(LLVMType[], ctx)
+        JuliaContext() do ts_ctx
+            ctx = GPUCompiler.unwrap_context(ts_ctx)
+            if !isghosttype(F) && !Core.Compiler.isconstType(F)
+                isboxed = GPUCompiler.deserves_argbox(F)
+                argexpr = :(func)
+                if isboxed
+                    push!(ccall_types, Any)
+                else
+                    et = convert(LLVMType, func; ctx)
+                    if isa(et, LLVM.SequentialType) # et->isAggregateType
+                        push!(ccall_types, Ptr{F})
+                        argexpr = Expr(:call, GlobalRef(Base, :Ref), argexpr)
+                    else
+                        push!(ccall_types, F)
+                    end
+                end
+                push!(argexprs, argexpr)
+            end
+
+            T_jlvalue = LLVM.StructType(LLVMType[]; ctx)
             T_prjlvalue = LLVM.PointerType(T_jlvalue, #= AddressSpace::Tracked =# 10)
 
             for (source_i, source_typ) in enumerate(argtypes)
@@ -167,7 +314,7 @@ module LazyCodegen
                 argexpr = :(args[$source_i])
 
                 isboxed = GPUCompiler.deserves_argbox(source_typ)
-                et = isboxed ? T_prjlvalue : convert(LLVMType, source_typ, ctx)
+                et = isboxed ? T_prjlvalue : convert(LLVMType, source_typ; ctx)
 
                 if isboxed
                     push!(ccall_types, Any)
@@ -185,7 +332,7 @@ module LazyCodegen
                 # In theory we could set `rettype` to `T_void`, but ccall will do that for us
             # elseif jl_is_uniontype?
             elseif !GPUCompiler.deserves_retbox(rettype)
-                rt = convert(LLVMType, rettype, ctx)
+                rt = convert(LLVMType, rettype; ctx)
                 if !isa(rt, LLVM.VoidType) && GPUCompiler.deserves_sret(rettype, rt)
                     before = :(sret = Ref{$rettype}())
                     pushfirst!(argexprs, :(sret))
@@ -208,7 +355,7 @@ module LazyCodegen
     @inline function call_delayed(f::F, args...) where F
         tt = Tuple{map(Core.Typeof, args)...}
         rt = Core.Compiler.return_type(f, tt)
-        ptr = deferred_codegen(Val(f), Val(tt))
-        abi_call(ptr, rt, tt, args...)
+        ptr = deferred_codegen(f, Val(tt))
+        abi_call(ptr, rt, tt, f, args...)
     end
 end

@@ -25,10 +25,10 @@ end
     end
 
     ir = sprint(io->ptx_code_llvm(io, kernel, Tuple{Aggregate}))
-    @test occursin(r"@.*julia_kernel.+\(({ i64 }|\[1 x i64\])\*", ir)
+    @test occursin(r"@.*julia_kernel.+\(({ i64 }|\[1 x i64\])\* ", ir)
 
     ir = sprint(io->ptx_code_llvm(io, kernel, Tuple{Aggregate}; kernel=true))
-    @test occursin(r"@.*julia_kernel.+\(({ i64 }|\[1 x i64\])", ir)
+    @test occursin(r"@.*julia_kernel.+\(.*({ i64 }|\[1 x i64\]) ", ir)
 end
 
 @testset "property_annotations" begin
@@ -38,7 +38,7 @@ end
     @test !occursin("nvvm.annotations", ir)
 
     ir = sprint(io->ptx_code_llvm(io, kernel, Tuple{};
-                                         dump_module=true, kernel=true))
+                                  dump_module=true, kernel=true))
     @test occursin("nvvm.annotations", ir)
     @test !occursin("maxntid", ir)
     @test !occursin("reqntid", ir)
@@ -75,6 +75,47 @@ LLVM.version() >= v"8" && @testset "calling convention" begin
     ir = sprint(io->ptx_code_llvm(io, kernel, Tuple{};
                                   dump_module=true, kernel=true))
     @test occursin("ptx_kernel", ir)
+end
+
+@testset "kernel state" begin
+    # state should be passed by value to kernel functions
+
+    kernel() = return
+
+    ir = sprint(io->ptx_code_llvm(io, kernel, Tuple{}))
+    @test any(occursin(r"@.*kernel.+\(\)", a) for a in split(ir, "\n"))
+
+    ir = sprint(io->ptx_code_llvm(io, kernel, Tuple{}; kernel=true))
+    @test any(occursin(r"@.*kernel.+\(\[1 x i64\] %state\)", a) for a in split(ir, "\n"))
+
+    # state should only passed to device functions that use it
+
+    @eval @noinline kernel_state_child1(ptr) = unsafe_load(ptr)
+    @eval @noinline function kernel_state_child2()
+        data = ptx_kernel_state().data
+        ptr = reinterpret(Ptr{Int}, data)
+        unsafe_load(ptr)
+    end
+
+    function kernel(ptr)
+        unsafe_store!(ptr, kernel_state_child1(ptr) + kernel_state_child2())
+        return
+    end
+
+    ir = sprint(io->ptx_code_llvm(io, kernel, Tuple{Ptr{Int64}};
+                                  kernel=true, dump_module=true))
+
+    # kernel should take state argument before all else
+    @test any(occursin(r"@.*kernel.+\(\[1 x i64\] %state", a) for a in split(ir, "\n"))
+
+    # child1 doesn't use the state
+    @test any(occursin(r"@.*child1.+\(i64", a) for a in split(ir, "\n"))
+
+    # child2 does
+    @test any(occursin(r"@.*child2.+\(\[1 x i64\] %state", a) for a in split(ir, "\n"))
+
+    # can't have the unlowered intrinsic
+    @test !any(occursin("julia.gpu.state_getter", a) for a in split(ir, "\n"))
 end
 end
 

@@ -3,7 +3,7 @@
 # final preparations for the module to be compiled to machine code
 # these passes should not be run when e.g. compiling to write to disk.
 function prepare_execution!(@nospecialize(job::CompilerJob), mod::LLVM.Module)
-    let pm = ModulePassManager()
+    @dispose pm=ModulePassManager() begin
         global current_job
         current_job = job
 
@@ -15,7 +15,6 @@ function prepare_execution!(@nospecialize(job::CompilerJob), mod::LLVM.Module)
         strip_dead_prototypes!(pm)
 
         run!(pm, mod)
-        dispose(pm)
     end
 
     return
@@ -40,7 +39,7 @@ function resolve_cpu_references!(mod::LLVM.Module)
             # eagerly resolve the address of the binding
             address = ccall(:jl_cglobal, Any, (Any, Any), fn, UInt)
             dereferenced = unsafe_load(address)
-            dereferenced = LLVM.ConstantInt(dereferenced, ctx)
+            dereferenced = LLVM.ConstantInt(dereferenced; ctx)
 
             function replace_bindings!(value)
                 changed = false
@@ -68,7 +67,7 @@ function resolve_cpu_references!(mod::LLVM.Module)
 end
 
 
-function mcgen(@nospecialize(job::CompilerJob), mod::LLVM.Module, f::LLVM.Function, format=LLVM.API.LLVMAssemblyFile)
+function mcgen(@nospecialize(job::CompilerJob), mod::LLVM.Module, format=LLVM.API.LLVMAssemblyFile)
     tm = llvm_machine(job.target)
 
     return String(emit(tm, mod, format))

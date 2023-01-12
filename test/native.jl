@@ -4,67 +4,102 @@ include("definitions/native.jl")
 
 ############################################################################################
 
-@testset "Compilation" begin
-    kernel() = nothing
+if VERSION >= v"1.8-"
+    using Cthulhu
+    include(joinpath(dirname(pathof(Cthulhu)), "..", "test", "FakeTerminals.jl"))
+    using .FakeTerminals
 
-    output = native_code_execution(kernel, (); validate=false)
-    @test occursin("kernel", output[2])
-    @test isempty(output[3])
-    @test isempty(output[4])
+    test_interactive = true
+else
+    test_interactive = false
+end
 
-    @testset "Undefined Functions" begin
-        function undef_fn()
-            ccall("extern somefunc", llvmcall, Cvoid, ())
-            nothing
-        end
+cread1(io) = readuntil(io, '↩'; keep=true)
+cread(io) = cread1(io) * cread1(io)
 
-        output = native_code_execution(undef_fn, (); validate=false)
-        @test length(output[3]) == 1
-        @test output[3][1] == "somefunc"
-    end
+@testset "reflection" begin
+    job, _ = native_job(identity, (Int,))
 
-    @testset "Undefined Globals" begin
-        @generated function makegbl(::Val{name}, ::Type{T}, ::Val{isext}) where {name,T,isext}
-            JuliaContext() do ctx
-                T_gbl = convert(LLVMType, T, ctx)
-                T_ptr = convert(LLVMType, Ptr{T}, ctx)
-                llvm_f, _ = create_function(T_ptr)
-                mod = LLVM.parent(llvm_f)
-                gvar = GlobalVariable(mod, T_gbl, string(name))
-                isext && extinit!(gvar, true)
-                Builder(ctx) do builder
-                    entry = BasicBlock(llvm_f, "entry", ctx)
-                    position!(builder, entry)
-                    result = ptrtoint!(builder, gvar, T_ptr)
-                    ret!(builder, result)
-                end
-                call_function(llvm_f, Ptr{T})
+    @test only(GPUCompiler.code_lowered(job)) isa Core.CodeInfo
+
+    CI, rt = only(GPUCompiler.code_typed(job))
+    @test rt === Int
+
+    IR = sprint(io->GPUCompiler.code_warntype(io, job))
+    @test contains(IR, "MethodInstance for identity")
+
+    IR = sprint(io->GPUCompiler.code_llvm(io, job))
+    @test contains(IR, "julia_identity")
+
+    ASM = sprint(io->GPUCompiler.code_native(io, job))
+    @test contains(ASM, "julia_identity")
+
+    if test_interactive
+        fake_terminal() do term, in, out
+            T = @async begin
+                GPUCompiler.code_typed(job, interactive=true, interruptexc=false, terminal=term)
             end
+            lines = replace(cread(out), r"\e\[[0-9;]*[a-zA-Z]"=>"") # without ANSI escape codes
+            @test contains(lines, "identity(x)")
+            write(in, 'q')
+            wait(T)
         end
-        function undef_gbl()
-            ext_ptr = makegbl(Val(:someglobal), Int64, Val(true))
-            Base.unsafe_store!(ext_ptr, 1)
-            ptr = makegbl(Val(:otherglobal), Float32, Val(false))
-            Base.unsafe_store!(ptr, 2f0)
-            nothing
-        end
-
-        output = native_code_execution(undef_gbl, ())
-        @test length(output[4]) == 2
-        @test output[4][1].name == "someglobal"
-        @test eltype(output[4][1].type) isa LLVM.IntegerType
-        @test output[4][1].external
-        @test output[4][2].name == "otherglobal"
-        @test eltype(output[4][2].type) isa LLVM.LLVMFloat
-        @test !output[4][2].external
     end
+end
 
+
+@testset "Compilation" begin
     @testset "Callable structs" begin
         struct MyCallable end
         (::MyCallable)(a, b) = a+b
 
         (CI, rt) = native_code_typed(MyCallable(), (Int, Int), kernel=false)[1]
         @test CI.slottypes[1] == Core.Compiler.Const(MyCallable())
+
+        (CI, rt) = native_code_typed(typeof(MyCallable()), (Int, Int), kernel=false)[1]
+        @test CI.slottypes[1] == Core.Compiler.Const(MyCallable())
+    end
+
+    @testset "Compilation database" begin
+        @noinline inner(x) = x+1
+        function outer(x)
+            return inner(x)
+        end
+
+        job, _ = native_job(outer, (Int,))
+        JuliaContext() do ctx
+            ir, meta = GPUCompiler.compile(:llvm, job; ctx)
+
+            meth = only(methods(outer, (Int,)))
+
+            mis = filter(mi->mi.def == meth, keys(meta.compiled))
+            @test length(mis) == 1
+
+            other_mis = filter(mi->mi.def != meth, keys(meta.compiled))
+            @test length(other_mis) == 1
+            @test only(other_mis).def in methods(inner)
+        end
+    end
+
+    @testset "Advanced database" begin
+        @noinline inner(x) = x+1
+        foo(x) = sum(inner, fill(x, 10, 10))
+
+        job, _ = native_job(foo, (Float64,))
+        JuliaContext() do ctx
+            # shouldn't segfault
+            ir, meta = GPUCompiler.compile(:llvm, job; ctx)
+
+            meth = only(methods(foo, (Float64,)))
+
+            mis = filter(mi->mi.def == meth, keys(meta.compiled))
+            @test length(mis) == 1
+
+            inner_methods = filter(keys(meta.compiled)) do mi
+                mi.def in methods(inner) && mi.specTypes == Tuple{typeof(inner), Float64}
+            end
+            @test length(inner_methods) == 1
+        end
     end
 end
 
@@ -148,10 +183,49 @@ end
     native_code_llvm(devnull, D32593, Tuple{Ptr{D32593_struct}})
 end
 
-@testset "Julia-level throw lowering" begin
-    kernel(ptr) = (unsafe_store!(ptr, sqrt(unsafe_load(ptr))); nothing)
+@testset "slow abi" begin
+    x = 2
+    f = () -> x+1
+    ir = sprint(io->native_code_llvm(io, f, Tuple{}, entry_abi=:func, dump_module=true))
+    @test occursin(r"define nonnull {}\* @jfptr", ir)
+    @test occursin(r"define internal fastcc .+ @julia", ir)
+    @test occursin(r"call fastcc .+ @julia", ir)
+end
 
-    native_code_execution(kernel, Tuple{Ptr{Float32}})
+@testset "function entry safepoint emission" begin
+    ir = sprint(io->native_code_llvm(io, identity, Tuple{Nothing}; entry_safepoint=false, optimize=false, dump_module=true))
+    @test !occursin("%safepoint", ir)
+
+    if v"1.9.0-DEV.1660" <= VERSION < v"1.9.0-alpha1.57" || VERSION >= v"1.10-"
+        ir = sprint(io->native_code_llvm(io, identity, Tuple{Nothing}; entry_safepoint=true, optimize=false, dump_module=true))
+        @test occursin("%safepoint", ir)
+    end
+end
+
+@testset "always_inline" begin
+    @eval f_expensive(x) = $(foldl((e, _) -> :(sink($e) + sink(x)), 1:100; init=:x))
+    function g(x)
+        f_expensive(x)
+        return
+    end
+    function h(x)
+        f_expensive(x)
+        return
+    end
+
+    ir = sprint(io->native_code_llvm(io, g, Tuple{Int64}; dump_module=true, kernel=true))
+    @test occursin(r"^define.*julia_f_expensive"m, ir)
+
+    ir = sprint(io->native_code_llvm(io, g, Tuple{Int64}; dump_module=true, kernel=true,
+                                     always_inline=true))
+    @test !occursin(r"^define.*julia_f_expensive"m, ir)
+
+    ir = sprint(io->native_code_llvm(io, h, Tuple{Int64}; dump_module=true, kernel=true,
+                                     always_inline=true))
+    @test !occursin(r"^define.*julia_f_expensive"m, ir)
+
+    ir = sprint(io->native_code_llvm(io, h, Tuple{Int64}; dump_module=true, kernel=true))
+    @test occursin(r"^define.*julia_f_expensive"m, ir)
 end
 
 end
@@ -251,9 +325,10 @@ end
                          native_code_execution(foobar, Tuple{Int})) do msg
         occursin("invalid LLVM IR", msg) &&
         (occursin(GPUCompiler.RUNTIME_FUNCTION, msg) ||
-         occursin(GPUCompiler.UNKNOWN_FUNCTION, msg)) &&
+         occursin(GPUCompiler.UNKNOWN_FUNCTION, msg) ||
+         occursin(GPUCompiler.DYNAMIC_CALL, msg)) &&
         occursin("[1] println", msg) &&
-        occursin(r"\[2\] .+foobar", msg)
+        occursin(r"\[2\] .*foobar", msg)
     end
 end
 
@@ -264,7 +339,7 @@ end
                          native_code_execution(foobar, Tuple{Ptr{Int}})) do msg
         occursin("invalid LLVM IR", msg) &&
         occursin(GPUCompiler.POINTER_FUNCTION, msg) &&
-        occursin(r"\[1\] .+foobar", msg)
+        occursin(r"\[1\] .*foobar", msg)
     end
 end
 
@@ -276,7 +351,7 @@ end
         occursin("invalid LLVM IR", msg) &&
         occursin(GPUCompiler.DELAYED_BINDING, msg) &&
         occursin("use of 'undefined'", msg) &&
-        occursin(r"\[1\] .+kernel", msg)
+        occursin(r"\[1\] .*kernel", msg)
     end
 end
 
@@ -305,21 +380,25 @@ end
     end
 end
 
+end
+
+############################################################################################
+
 @testset "LazyCodegen" begin
     import .LazyCodegen: call_delayed
 
-    global flag = Ref(false) # otherwise f is a closure and we can't
-                             # pass it to `Val`...
-    f() = (flag[]=true; nothing)
+    f(A) = (A[] += 42; nothing)
 
+    global flag = [0]
     function caller()
-        call_delayed(f)
+        call_delayed(f, flag::Vector{Int})
     end
     @test caller() === nothing
-    @test flag[]
+    @test flag[] == 42
 
     ir = sprint(io->native_code_llvm(io, caller, Tuple{}, dump_module=true))
-    @test occursin(r"define void @julia_f_\d+", ir)
+    @test occursin(r"add i64 %\d+, 42", ir)
+    # NOTE: can't just look for `jl_f` here, since it may be inlined and optimized away.
 
     add(x, y) = x+y
     function call_add(x, y)
@@ -344,15 +423,84 @@ end
 
     # Test ABI removal
     ir = sprint(io->native_code_llvm(io, call_real, Tuple{ComplexF64}))
-    @test !occursin(r"alloca", ir)
+    @test !occursin("alloca", ir)
 
     ghostly_identity(x, y) = y
     @test call_delayed(ghostly_identity, nothing, 1) == 1
 
     # tests struct return
-    @test call_delayed(complex, 1.0, 2.0) == 1.0+2.0im
+    if Sys.ARCH != :aarch64
+        @test call_delayed(complex, 1.0, 2.0) == 1.0+2.0im
+    else
+        @test_broken call_delayed(complex, 1.0, 2.0) == 1.0+2.0im
+    end
+
+    throws(arr, i) = arr[i]
+    @test call_delayed(throws, [1], 1) == 1
+    @test_throws BoundsError call_delayed(throws, [1], 0)
+
+    struct Closure
+        x::Int64
+    end
+    (c::Closure)(b) = c.x+b
+
+    @test call_delayed(Closure(3), 5) == 8
+
+    struct Closure2
+        x::Integer
+    end
+    (c::Closure2)(b) = c.x+b
+
+    @test call_delayed(Closure2(3), 5) == 8
 end
 
+############################################################################################
+
+@testset "overrides" begin
+    # NOTE: method overrides do not support redefinitions, so we use different kernels
+
+    mod = @eval module $(gensym())
+        kernel() = child()
+        child() = 0
+    end
+
+    ir = sprint(io->native_code_llvm(io, mod.kernel, Tuple{}))
+    @test occursin("ret i64 0", ir)
+
+    mod = @eval module $(gensym())
+        using ..GPUCompiler
+        import ..method_table
+
+        kernel() = child()
+        child() = 0
+
+        GPUCompiler.@override method_table child() = 1
+    end
+
+    ir = sprint(io->native_code_llvm(io, mod.kernel, Tuple{}))
+    @test occursin("ret i64 1", ir)
+end
+
+@testset "#366: semi-concrete interpretation + overlay methods = dynamic dispatch" begin
+    mod = @eval module $(gensym())
+        using ..GPUCompiler
+        import ..method_table
+        using StaticArrays
+
+        function kernel(width, height)
+            xy = SVector{2, Float32}(0.5f0, 0.5f0)
+            res = SVector{2, UInt32}(width, height)
+            floor.(UInt32, max.(0f0, xy) .* res)
+            return
+        end
+
+        GPUCompiler.@override method_table Base.isnan(x::Float32) =
+            (ccall("extern __nv_isnanf", llvmcall, Int32, (Cfloat,), x)) != 0
+    end
+
+    ir = sprint(io->native_code_llvm(io, mod.kernel, Tuple{Int, Int}; debuginfo=:none))
+    @test !occursin("apply_generic", ir)
+    @test occursin("llvm.floor", ir)
 end
 
 ############################################################################################

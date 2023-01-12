@@ -1,5 +1,7 @@
 # compiler driver and main interface
 
+export JuliaContext
+
 # NOTE: the keyword arguments to compile/codegen control those aspects of compilation that
 #       might have to be changed (e.g. set libraries=false when recursing, or set
 #       strip=true for reflection). What remains defines the compilation job itself,
@@ -21,6 +23,7 @@ The following keyword arguments are supported:
 - `libraries`: link the GPU runtime and `libdevice` libraries (if required)
 - `deferred_codegen`: resolve deferred compiler invocations (if required)
 - `optimize`: optimize the code (default: true)
+- `cleanup`: run cleanup passes on the code (default: true)
 - `strip`: strip non-functional metadata and debug information (default: false)
 - `validate`: validate the generated IR before emitting machine code (default: true)
 - `only_entry`: only keep the entry function, remove all others (default: false).
@@ -30,58 +33,119 @@ Other keyword arguments can be found in the documentation of [`cufunction`](@ref
 """
 function compile(target::Symbol, @nospecialize(job::CompilerJob);
                  libraries::Bool=true, deferred_codegen::Bool=true,
-                 optimize::Bool=true, strip::Bool=false, validate::Bool=true,
-                 only_entry::Bool=false)
+                 optimize::Bool=true, cleanup::Bool=true, strip::Bool=false,
+                 validate::Bool=true, only_entry::Bool=false,
+                 ctx::Union{JuliaContextType,Nothing}=nothing)
     if compile_hook[] !== nothing
         compile_hook[](job)
     end
 
     return codegen(target, job;
-                   libraries, deferred_codegen, optimize, strip, validate, only_entry)
+                   libraries, deferred_codegen, optimize, cleanup, strip, validate, only_entry, ctx)
 end
+
+# transitionary feature to deal versions of Julia that rely on a global context
+#
+# Julia 1.9 removed the global LLVM context, requiring to pass a context to codegen APIs,
+# so the GPUCompiler APIs have been adapted to require passing a Context object as well.
+# however, on older versions of Julia we cannot make codegen emit into that context. we
+# could use a hack (serialize + deserialize) to move code into the correct context, however
+# as it turns out some of our optimization passes erroneously rely on the context being
+# global and unique, resulting in segfaults when we use a local context instead.
+#
+# to work around this mess, and still present a reasonably unified API, we introduce the
+# JuliaContext helper below, which returns a local context on Julia 1.9, and the global
+# unique context on all other versions. Once we only support Julia 1.9, we'll deprecate
+# this helper to a regular `Context()` call.
+function JuliaContext()
+    if VERSION >= v"1.9.0-DEV.115"
+        # Julia 1.9 knows how to deal with arbitrary contexts
+        JuliaContextType()
+    else
+        # earlier versions of Julia claim so, but actually use a global context
+        isboxed_ref = Ref{Bool}()
+        typ = LLVMType(ccall(:jl_type_to_llvm, LLVM.API.LLVMTypeRef,
+                       (Any, Ptr{Bool}), Any, isboxed_ref))
+        context(typ)
+    end
+end
+function JuliaContext(f)
+    if VERSION >= v"1.9.0-DEV.115"
+        JuliaContextType(f)
+    else
+        f(JuliaContext())
+        # we cannot dispose of the global unique context
+    end
+end
+
+if VERSION >= v"1.9.0-DEV.516"
+unwrap_context(ctx::ThreadSafeContext) = context(ctx)
+end
+unwrap_context(ctx::Context) = ctx
 
 function codegen(output::Symbol, @nospecialize(job::CompilerJob);
                  libraries::Bool=true, deferred_codegen::Bool=true, optimize::Bool=true,
-                 strip::Bool=false, validate::Bool=true, only_entry::Bool=false, parent_job::Union{Nothing, CompilerJob} = nothing)
+                 cleanup::Bool=true, strip::Bool=false, validate::Bool=true,
+                 only_entry::Bool=false, parent_job::Union{Nothing, CompilerJob}=nothing,
+                 ctx::Union{JuliaContextType,Nothing}=nothing)
     ## Julia IR
 
-    method_instance, _ = emit_julia(job)
+    mi, mi_meta = emit_julia(job)
 
-    output == :julia && return method_instance
+    if output == :julia
+        return mi, mi_meta
+    end
 
+    temporary_context = ctx === nothing
+    if temporary_context && output == :llvm
+        # if we return IR structures, we cannot construct a temporary context
+        error("Request to return LLVM IR; please provide a context")
+    end
 
-    ## LLVM IR
+    try
+        ## LLVM IR
 
-    ir, kernel = emit_llvm(job, method_instance;
-                           libraries, deferred_codegen, optimize, only_entry)
-
-    if output == :llvm
-        if strip
-            @timeit_debug to "strip debug info" strip_debuginfo!(ir)
+        if temporary_context
+            ctx = JuliaContext()
+        elseif VERSION < v"1.9.0-DEV.115" && ctx != JuliaContext()
+            error("""Julia <1.9 does not suppport generating code in an arbitrary LLVM context.
+                     Use a JuliaContext instead.""")
         end
 
-        return ir, kernel
+        ir, ir_meta = emit_llvm(job, mi; libraries, deferred_codegen, optimize, cleanup, only_entry, ctx)
+
+        if output == :llvm
+            if strip
+                @timeit_debug to "strip debug info" strip_debuginfo!(ir)
+            end
+
+            return ir, ir_meta
+        end
+
+
+        ## machine code
+
+        format = if output == :asm
+            LLVM.API.LLVMAssemblyFile
+        elseif output == :obj
+            LLVM.API.LLVMObjectFile
+        else
+            error("Unknown assembly format $output")
+        end
+        asm, asm_meta = emit_asm(job, ir; strip, validate, format)
+
+        if output == :asm || output == :obj
+            return asm, asm_meta
+        end
+
+
+        error("Unknown compilation output $output")
+    finally
+        if temporary_context && VERSION >= v"1.9.0-DEV.115"
+            @assert ctx != JuliaContext()
+            dispose(ctx)
+        end
     end
-
-
-    ## machine code
-
-    format = if output == :asm
-        LLVM.API.LLVMAssemblyFile
-    elseif output == :obj
-        LLVM.API.LLVMObjectFile
-    else
-        error("Unknown assembly format $output")
-    end
-    code = emit_asm(job, ir, kernel; strip, validate, format)
-
-    undefined_fns = LLVM.name.(decls(ir))
-    undefined_gbls = map(x->(name=LLVM.name(x),type=llvmtype(x),external=isextinit(x)), LLVM.globals(ir))
-
-    (output == :asm || output == :obj) && return code, LLVM.name(kernel), undefined_fns, undefined_gbls
-
-
-    error("Unknown compilation output $output")
 end
 
 @locked function emit_julia(@nospecialize(job::CompilerJob))
@@ -90,11 +154,14 @@ end
     @timeit_debug to "Julia front-end" begin
 
         # get the method instance
-        meth = which(job.source.f, job.source.tt)
-        sig = Base.signature_type(job.source.f, job.source.tt)::Type
+        sig = typed_signature(job)
+        meth = which(sig)
+
         (ti, env) = ccall(:jl_type_intersection_with_env, Any,
                           (Any, Any), sig, meth.sig)::Core.SimpleVector
+
         meth = Base.func_for_method_checked(meth, ti, env)
+
         method_instance = ccall(:jl_specializations_get_linfo, Ref{Core.MethodInstance},
                       (Any, Any, Any, UInt), meth, ti, env, job.source.world)
 
@@ -105,8 +172,7 @@ end
         end
     end
 
-    # XXX: remove returned world for next breaking release
-    return method_instance, job.source.world
+    return method_instance, ()
 end
 
 # primitive mechanism for deferred compilation, for implementing CUDA dynamic parallelism.
@@ -131,103 +197,76 @@ end
     end
 end
 
-@locked function emit_llvm(@nospecialize(job::CompilerJob), @nospecialize(method_instance),
-                           world=job.source.world;
+const __llvm_initialized = Ref(false)
+
+@locked function emit_llvm(@nospecialize(job::CompilerJob), @nospecialize(method_instance);
                            libraries::Bool=true, deferred_codegen::Bool=true, optimize::Bool=true,
-                           only_entry::Bool=false)
-    # XXX: remove world argument for next breaking release
-    @assert world == job.source.world
+                           cleanup::Bool=true, only_entry::Bool=false, ctx::JuliaContextType)
+    if !__llvm_initialized[]
+        InitializeAllTargets()
+        InitializeAllTargetInfos()
+        InitializeAllAsmPrinters()
+        InitializeAllAsmParsers()
+        InitializeAllTargetMCs()
+        __llvm_initialized[] = true
+    end
 
     @timeit_debug to "IR generation" begin
-        ir, kernel = irgen(job, method_instance)
-        ctx = context(ir)
-        kernel_fn = LLVM.name(kernel)
+        ir, compiled = irgen(job, method_instance; ctx)
+        if job.entry_abi === :specfunc
+            entry_fn = compiled[method_instance].specfunc
+        else
+            entry_fn = compiled[method_instance].func
+        end
+        entry = functions(ir)[entry_fn]
     end
 
     # always preload the runtime, and do so early; it cannot be part of any timing block
     # because it recurses into the compiler
-    if libraries
-        runtime = load_runtime(job, ctx)
-        if haskey(globals(runtime), "llvm.used")
-            # the runtime shouldn't link-in stuff that gets preserved in the output. this is
-            # a hack to get rid of the device function slots emitted by the PTX back-end,
-            # but it also makes sense.
-            gv = globals(runtime)["llvm.used"]
-            LLVM.unsafe_delete!(runtime, gv)
-        end
+    if !uses_julia_runtime(job) && libraries
+        runtime = load_runtime(job; ctx)
         runtime_fns = LLVM.name.(defs(runtime))
+        runtime_intrinsics = ["julia.gc_alloc_obj"]
     end
 
-    @timeit_debug to "LLVM middle-end" begin
-        # target-specific libraries
+    @timeit_debug to "Library linking" begin
         if libraries
+            # target-specific libraries
             undefined_fns = LLVM.name.(decls(ir))
             @timeit_debug to "target libraries" link_libraries!(job, ir, undefined_fns)
-        end
 
-        if optimize
-            @timeit_debug to "optimization" optimize!(job, ir)
-
-            # optimization may have replaced functions, so look the entry point up again
-            kernel = functions(ir)[kernel_fn]
-        end
-
-        if libraries
-            undefined_fns = LLVM.name.(decls(ir))
-            if any(fn -> fn in runtime_fns, undefined_fns)
+            # GPU run-time library
+            if !uses_julia_runtime(job) && any(fn -> fn in runtime_fns || fn in runtime_intrinsics, undefined_fns)
                 @timeit_debug to "runtime library" link_library!(ir, runtime)
             end
         end
-
-        if ccall(:jl_is_debugbuild, Cint, ()) == 1
-            @timeit_debug to "verification" verify(ir)
-        end
-
-        if only_entry
-            # replace non-entry function definitions with a declaration
-            for f in functions(ir)
-                f == kernel && continue
-                isdeclaration(f) && continue
-                LLVM.isintrinsic(f) && continue
-                # FIXME: expose llvm::Function::deleteBody with a C API
-                fn = LLVM.name(f)
-                LLVM.name!(f, "")
-                f′ = LLVM.Function(ir, fn, eltype(llvmtype(f)))
-                # copying attributes is broken due to maleadt/LLVM.jl#186,
-                # but that doesn't matter because `only_entry` is only used for reflection,
-                # and the emitted code has already been optimized at this point.
-                replace_uses!(f, f′)
-            end
-        end
-
-        # remove everything except for the kernel and any exported global variables
-        @timeit_debug to "clean-up" begin
-            exports = String[kernel_fn]
-            for gvar in globals(ir)
-                push!(exports, LLVM.name(gvar))
-            end
-
-            ModulePassManager() do pm
-                internalize!(pm, exports)
-
-                # eliminate all unused internal functions
-                global_optimizer!(pm)
-                global_dce!(pm)
-                strip_dead_prototypes!(pm)
-
-                # merge constants (such as exception messages) from the runtime
-                constant_merge!(pm)
-
-                run!(pm, ir)
-            end
-        end
     end
 
-    # deferred code generation
-    if !only_entry && deferred_codegen && haskey(functions(ir), "deferred_codegen")
-        dyn_marker = functions(ir)["deferred_codegen"]
+    # mark everything internal except for the entry and any exported global variables.
+    # this makes sure that the optimizer can, e.g., touch function signatures.
+    @dispose pm=ModulePassManager() begin
+        # NOTE: this needs to happen after linking libraries to remove unused functions,
+        #       but before deferred codegen so that all kernels remain available.
+        exports = String[entry_fn]
+        for gvar in globals(ir)
+            if linkage(gvar) == LLVM.API.LLVMExternalLinkage
+                push!(exports, LLVM.name(gvar))
+            end
+        end
+        internalize!(pm, exports)
+        run!(pm, ir)
+    end
 
-        cache = Dict{CompilerJob, String}(job => kernel_fn)
+    # finalize the current module. this needs to happen before linking deferred modules,
+    # since those modules have been finalized themselves, and we don't want to re-finalize.
+    entry = finish_module!(job, ir, entry)
+
+    # deferred code generation
+    do_deferred_codegen = !only_entry && deferred_codegen &&
+                          haskey(functions(ir), "deferred_codegen")
+    deferred_jobs = Dict{CompilerJob, String}(job => entry_fn)
+    if do_deferred_codegen
+        dyn_marker = functions(ir)["deferred_codegen"]
 
         # iterative compilation (non-recursive)
         changed = true
@@ -236,7 +275,7 @@ end
 
             # find deferred compiler
             # TODO: recover this information earlier, from the Julia IR
-            worklist = MultiDict{CompilerJob, LLVM.CallInst}()
+            worklist = Dict{CompilerJob, Vector{LLVM.CallInst}}()
             for use in uses(dyn_marker)
                 # decode the call
                 call = user(use)::LLVM.CallInst
@@ -247,29 +286,30 @@ end
                 if dyn_job isa FunctionSpec
                     dyn_job = similar(job, dyn_job)
                 end
-                push!(worklist, dyn_job => call)
+                push!(get!(worklist, dyn_job, LLVM.CallInst[]), call)
             end
 
             # compile and link
             for dyn_job in keys(worklist)
                 # cached compilation
-                dyn_kernel_fn = get!(cache, dyn_job) do
-                    dyn_ir, dyn_kernel = codegen(:llvm, dyn_job; optimize,
-                                                 deferred_codegen=false, parent_job=job)
-                    dyn_kernel_fn = LLVM.name(dyn_kernel)
-                    @assert context(dyn_ir) == ctx
+                dyn_entry_fn = get!(deferred_jobs, dyn_job) do
+                    dyn_ir, dyn_meta = codegen(:llvm, dyn_job; optimize=false,
+                                               deferred_codegen=false, parent_job=job, ctx)
+                    dyn_entry_fn = LLVM.name(dyn_meta.entry)
+                    merge!(compiled, dyn_meta.compiled)
+                    @assert context(dyn_ir) == unwrap_context(ctx)
                     link!(ir, dyn_ir)
                     changed = true
-                    dyn_kernel_fn
+                    dyn_entry_fn
                 end
-                dyn_kernel = functions(ir)[dyn_kernel_fn]
+                dyn_entry = functions(ir)[dyn_entry_fn]
 
-                # insert a pointer to the function everywhere the kernel is used
-                T_ptr = convert(LLVMType, Ptr{Cvoid}, ctx)
+                # insert a pointer to the function everywhere the entry is used
+                T_ptr = convert(LLVMType, Ptr{Cvoid}; ctx=unwrap_context(ctx))
                 for call in worklist[dyn_job]
-                    Builder(ctx) do builder
+                    @dispose builder=Builder(unwrap_context(ctx)) begin
                         position!(builder, call)
-                        fptr = ptrtoint!(builder, dyn_kernel, T_ptr)
+                        fptr = ptrtoint!(builder, dyn_entry, T_ptr)
                         replace_uses!(call, fptr)
                     end
                     unsafe_delete!(LLVM.parent(call), call)
@@ -277,50 +317,118 @@ end
             end
         end
 
-        # merge constants (such as exception messages) from each kernel
-        # and on platforms that support it inline and optimize the call to
-        # the deferred code, in particular we want to remove unnecessary
-        # alloca's that are created by pass-by-ref semantics.
-        ModulePassManager() do pm
-            instruction_combining!(pm)
-            constant_merge!(pm)
-            always_inliner!(pm)
-            scalar_repl_aggregates_ssa!(pm)
-            promote_memory_to_register!(pm)
-            gvn!(pm)
-
-            run!(pm, ir)
-        end
-
         # all deferred compilations should have been resolved
         @compiler_assert isempty(uses(dyn_marker)) job
         unsafe_delete!(ir, dyn_marker)
     end
 
-    return ir, kernel
+    @timeit_debug to "IR post-processing" begin
+        # mark the kernel entry-point functions (optimization may need it)
+        if job.source.kernel
+            push!(metadata(ir)["julia.kernel"], MDNode([entry]; ctx=unwrap_context(ctx)))
+
+            # IDEA: save all jobs, not only kernels, and save other attributes
+            #       so that we can reconstruct the CompileJob instead of setting it globally
+        end
+
+        if optimize
+            @timeit_debug to "optimization" begin
+                optimize!(job, ir)
+
+                # deferred codegen has some special optimization requirements,
+                # which also need to happen _after_ regular optimization.
+                # XXX: make these part of the optimizer pipeline?
+                do_deferred_codegen && @dispose pm=ModulePassManager() begin
+                    # inline and optimize the call to e deferred code. in particular we want
+                    # to remove unnecessary alloca's created by pass-by-ref semantics.
+                    instruction_combining!(pm)
+                    always_inliner!(pm)
+                    scalar_repl_aggregates_ssa!(pm)
+                    promote_memory_to_register!(pm)
+                    gvn!(pm)
+
+                    # merge duplicate functions, since each compilation invocation emits everything
+                    # XXX: ideally we want to avoid emitting these in the first place
+                    merge_functions!(pm)
+
+                    run!(pm, ir)
+                end
+            end
+
+            # optimization may have replaced functions, so look the entry point up again
+            entry = functions(ir)[entry_fn]
+        end
+
+        if cleanup
+            @timeit_debug to "clean-up" begin
+                # we can only clean-up now, as optimization may lower or introduce calls to
+                # functions from the GPU runtime (e.g. julia.gc_alloc_obj -> gpu_gc_pool_alloc)
+                @dispose pm=ModulePassManager() begin
+                    # eliminate all unused internal functions
+                    global_optimizer!(pm)
+                    global_dce!(pm)
+                    strip_dead_prototypes!(pm)
+
+                    # merge constants (such as exception messages)
+                    constant_merge!(pm)
+
+                    run!(pm, ir)
+                end
+            end
+        end
+
+        # finish the module
+        #
+        # we want to finish the module after optimization, so we cannot do so during
+        # deferred code generation. instead, process the deferred jobs here.
+        if deferred_codegen
+            entry = finish_ir!(job, ir, entry)
+
+            for (deferred_job, deferred_fn) in deferred_jobs
+                deferred_job == job && continue
+                finish_ir!(deferred_job, ir, functions(ir)[deferred_fn])
+            end
+        end
+
+        # replace non-entry function definitions with a declaration
+        # NOTE: we can't do this before optimization, because the definitions of called
+        #       functions may affect optimization.
+        if only_entry
+            for f in functions(ir)
+                f == entry && continue
+                isdeclaration(f) && continue
+                LLVM.isintrinsic(f) && continue
+                empty!(f)
+            end
+        end
+
+        if should_verify()
+            @timeit_debug to "verification" verify(ir)
+        end
+    end
+
+    return ir, (; entry, compiled)
 end
 
-@locked function emit_asm(@nospecialize(job::CompilerJob), ir::LLVM.Module, kernel::LLVM.Function;
+@locked function emit_asm(@nospecialize(job::CompilerJob), ir::LLVM.Module;
                           strip::Bool=false, validate::Bool=true, format::LLVM.API.LLVMCodeGenFileType)
-    finish_module!(job, ir)
-
     if validate
-        @timeit_debug to "validation" begin
-            check_invocation(job, kernel)
+        @timeit_debug to "Validation" begin
+            check_invocation(job)
             check_ir(job, ir)
         end
     end
 
     # NOTE: strip after validation to get better errors
     if strip
-        @timeit_debug to "strip debug info" strip_debuginfo!(ir)
+        @timeit_debug to "Debug info removal" strip_debuginfo!(ir)
     end
 
     @timeit_debug to "LLVM back-end" begin
         @timeit_debug to "preparation" prepare_execution!(job, ir)
 
-        code = @timeit_debug to "machine-code generation" mcgen(job, ir, kernel, format)
+        code = @timeit_debug to "machine-code generation" mcgen(job, ir, format)
     end
 
-    return code
+    return code, ()
 end

@@ -1,4 +1,4 @@
-using SPIRV_LLVM_Translator_jll, SPIRV_Tools_jll
+using SPIRV_LLVM_Translator_unified_jll, SPIRV_Tools_jll
 
 @testset "SPIR-V" begin
 
@@ -27,7 +27,7 @@ end
     @test occursin(r"@.*julia_.+_kernel.+\(({ i64 }|\[1 x i64\])\*", ir)
 
     ir = sprint(io->spirv_code_llvm(io, kernel, Tuple{Tuple{Int}}; kernel=true))
-    @test occursin(r"@.*julia_.+_kernel.+\({ ({ i64 }|\[1 x i64\]) }\*.+byval", ir)
+    @test occursin(r"@.*julia_.+_kernel.+\(.*{ ({ i64 }|\[1 x i64\]) }\*.+byval", ir)
 end
 
 @testset "byval bug" begin

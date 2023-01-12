@@ -8,6 +8,7 @@ Base.@kwdef struct GCNCompilerTarget <: AbstractCompilerTarget
     dev_isa::String
     features::String=""
 end
+GCNCompilerTarget(dev_isa; features="") = GCNCompilerTarget(dev_isa, features)
 
 llvm_triple(::GCNCompilerTarget) = "amdgcn-amd-amdhsa"
 
@@ -17,9 +18,8 @@ function llvm_machine(target::GCNCompilerTarget)
 
     cpu = target.dev_isa
     feat = target.features
-    optlevel = LLVM.API.LLVMCodeGenLevelDefault
     reloc = LLVM.API.LLVMRelocPIC
-    tm = TargetMachine(t, triple, cpu, feat, optlevel, reloc)
+    tm = TargetMachine(t, triple, cpu, feat; reloc)
     asm_verbosity!(tm, true)
 
     return tm
@@ -35,18 +35,10 @@ runtime_slug(job::CompilerJob{GCNCompilerTarget}) = "gcn-$(job.target.dev_isa)$(
 const gcn_intrinsics = () # TODO: ("vprintf", "__assertfail", "malloc", "free")
 isintrinsic(::CompilerJob{GCNCompilerTarget}, fn::String) = in(fn, gcn_intrinsics)
 
-# we have to fake our target early in the pipeline because Julia's optimization passes
-# weren't designed for a non-0 stack addrspace, and the AMDGPU target is very strict
-# about which addrspaces are permitted for various code patterns
-function process_module!(job::CompilerJob{GCNCompilerTarget}, mod::LLVM.Module)
-    triple!(mod, llvm_triple(NativeCompilerTarget()))
-    datalayout!(mod, julia_datalayout(NativeCompilerTarget()))
-end
-
 function process_entry!(job::CompilerJob{GCNCompilerTarget}, mod::LLVM.Module, entry::LLVM.Function)
-    if job.source.kernel
-        entry = lower_byval(job, mod, entry)
+    entry = invoke(process_entry!, Tuple{CompilerJob, LLVM.Module, LLVM.Function}, job, mod, entry)
 
+    if job.source.kernel
         # calling convention
         callconv!(entry, LLVM.API.LLVMAMDGPUKERNELCallConv)
     end
@@ -57,6 +49,32 @@ end
 function add_lowering_passes!(job::CompilerJob{GCNCompilerTarget}, pm::LLVM.PassManager)
     add!(pm, ModulePass("LowerThrowExtra", lower_throw_extra!))
 end
+
+function finish_module!(@nospecialize(job::CompilerJob{GCNCompilerTarget}),
+                        mod::LLVM.Module, entry::LLVM.Function)
+    entry = invoke(finish_module!, Tuple{CompilerJob, LLVM.Module, LLVM.Function}, job, mod, entry)
+
+    if job.source.kernel
+        # work around bad byval codegen (JuliaGPU/GPUCompiler.jl#92)
+        entry = lower_byval(job, mod, entry)
+    end
+
+    return entry
+end
+
+function optimize!(job::CompilerJob{GCNCompilerTarget}, mod::LLVM.Module)
+    @static if VERSION < v"1.9.0-DEV.1018"
+        # we have to fake our target early in the pipeline because Julia's
+        # optimization passes weren't designed for a non-0 stack addrspace, and the
+        # AMDGPU target is very strict about which addrspaces are permitted for
+        # various code patterns
+        triple!(mod, llvm_triple(NativeCompilerTarget()))
+        datalayout!(mod, julia_datalayout(NativeCompilerTarget()))
+    end
+
+    invoke(optimize!, Tuple{CompilerJob, LLVM.Module}, job, mod)
+end
+
 # We need to do alloca rewriting (from 0 to 5) after Julia's optimization
 # passes because of two reasons:
 # 1. Debug builds call the target verifier first, which would trip if AMDGPU
@@ -64,20 +82,25 @@ end
 # 2. We don't want any chance of messing with Julia's optimizations, since they
 #    eliminate target-unsafe IR patterns
 function optimize_module!(job::CompilerJob{GCNCompilerTarget}, mod::LLVM.Module)
-    # revert back to the AMDGPU target
-    triple!(mod, llvm_triple(job.target))
-    datalayout!(mod, julia_datalayout(job.target))
+    @static if VERSION < v"1.9.0-DEV.1018"
+        # revert back to the AMDGPU target
+        triple!(mod, llvm_triple(job.target))
+        datalayout!(mod, julia_datalayout(job.target))
 
-    tm = llvm_machine(job.target)
-    ModulePassManager() do pm
-        add_library_info!(pm, triple(mod))
-        add_transform_info!(pm, tm)
+        tm = llvm_machine(job.target)
+        @dispose pm=ModulePassManager() begin
+            add_library_info!(pm, triple(mod))
+            add_transform_info!(pm, tm)
 
-        add!(pm, FunctionPass("FixAllocaAddrspace", fix_alloca_addrspace!))
+            add!(pm, FunctionPass("FixAllocaAddrspace", fix_alloca_addrspace!))
 
-        run!(pm, mod)
+            run!(pm, mod)
+        end
     end
 end
+
+
+## LLVM passes
 
 function lower_throw_extra!(mod::LLVM.Module)
     job = current_job::CompilerJob
@@ -93,7 +116,6 @@ function lower_throw_extra!(mod::LLVM.Module)
         r"julia___subarray_throw_boundserror.*",
     ]
 
-
     for f in functions(mod)
         f_name = LLVM.name(f)
         for fn in throw_functions
@@ -102,14 +124,14 @@ function lower_throw_extra!(mod::LLVM.Module)
                     call = user(use)::LLVM.CallInst
 
                     # replace the throw with a trap
-                    let builder = Builder(ctx)
+                    @dispose builder=Builder(ctx) begin
                         position!(builder, call)
                         emit_exception!(builder, f_name, call)
-                        dispose(builder)
                     end
 
                     # remove the call
-                    call_args = collect(operands(call))[1:end-1] # last arg is function itself
+                    nargs = length(parameters(f))
+                    call_args = arguments(call)
                     unsafe_delete!(LLVM.parent(call), call)
 
                     # HACK: kill the exceptions' unused arguments
@@ -137,6 +159,7 @@ function lower_throw_extra!(mod::LLVM.Module)
     end
     return changed
 end
+
 function fix_alloca_addrspace!(fn::LLVM.Function)
     changed = false
     alloca_as = 5
@@ -150,7 +173,7 @@ function fix_alloca_addrspace!(fn::LLVM.Function)
                 addrspace(ty) == alloca_as && continue
 
                 new_insn = nothing
-                Builder(ctx) do builder
+                @dispose builder=Builder(ctx) begin
                     position!(builder, insn)
                     _alloca = alloca!(builder, ety, name(insn))
                     new_insn = addrspacecast!(builder, _alloca, ty)
@@ -163,7 +186,6 @@ function fix_alloca_addrspace!(fn::LLVM.Function)
 
     return changed
 end
-
 
 function emit_trap!(job::CompilerJob{GCNCompilerTarget}, builder, mod, inst)
     ctx = context(mod)
@@ -187,7 +209,7 @@ function emit_trap!(job::CompilerJob{GCNCompilerTarget}, builder, mod, inst)
         # this, the target will only attempt to do a "masked branch", which
         # only works on vector instructions (trap is a scalar instruction, and
         # therefore it is executed even when EXEC==0).
-        rl_val = call!(builder, rl, [ConstantInt(Int32(32), ctx)])
+        rl_val = call!(builder, rl, [ConstantInt(Int32(32); ctx)])
         rl_bc = inttoptr!(builder, rl_val, LLVM.PointerType(LLVM.Int32Type(ctx)))
         store!(builder, rl_val, rl_bc)
     end

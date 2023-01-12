@@ -3,19 +3,11 @@ module GPUCompiler
 using LLVM
 using LLVM.Interop
 
-using DataStructures
-
 using TimerOutputs
 
-using ExprTools
+using ExprTools: splitdef, combinedef
 
 using Libdl
-
-const to = TimerOutput()
-
-timings() = (TimerOutputs.print_timer(to); println())
-
-enable_timings() = (TimerOutputs.enable_debug_timings(GPUCompiler); return)
 
 include("utils.jl")
 
@@ -27,6 +19,7 @@ include("ptx.jl")
 include("gcn.jl")
 include("spirv.jl")
 include("bpf.jl")
+include("metal.jl")
 include("wasm.jl")
 
 include("runtime.jl")
@@ -46,20 +39,11 @@ include("cache.jl")
 include("execution.jl")
 include("reflection.jl")
 
-function __init__()
-    TimerOutputs.reset_timer!(to)
-    InitializeAllTargets()
-    InitializeAllTargetInfos()
-    InitializeAllAsmPrinters()
-    InitializeAllAsmParsers()
-    InitializeAllTargetMCs()
-
-    disk_cache[] = parse(Bool, get(ENV, "JULIA_GPUCOMPILER_DISKCACHE", "false"))
-
-    return
-end
-
 include("precompile.jl")
 _precompile_()
+
+function __init__()
+    STDERR_HAS_COLOR[] = get(stderr, :color, false)
+end
 
 end # module
