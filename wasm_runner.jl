@@ -19,11 +19,9 @@ const wasmfunction_cache = Dict{UInt,Any}()
 
 # actual compilation
 function wasmfunction_compile(@nospecialize(job::WASMCompilerJob))
-
   # compile to WASM
   mi, mi_meta = GPUCompiler.emit_julia(job)
   ir, ir_meta = GPUCompiler.emit_llvm(job, mi; libraries=true, ctx=JuliaContext())
-  print(ir)
   asm, asm_meta = GPUCompiler.emit_asm(job, ir; format=LLVM.API.LLVMObjectFile, validate=false)
   return collect(codeunits(asm))
 end
